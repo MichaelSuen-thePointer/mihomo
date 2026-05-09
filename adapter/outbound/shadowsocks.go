@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/structure"
@@ -29,13 +30,14 @@ type ShadowSocks struct {
 
 	option *ShadowSocksOption
 	// obfs
-	obfsMode        string
-	obfsOption      *simpleObfsOption
-	v2rayOption     *v2rayObfs.Option
-	gostOption      *gost.Option
-	shadowTLSOption *shadowtls.ShadowTLSOption
-	restlsConfig    *restls.Config
-	kcptunClient    *kcptun.Client
+	obfsMode            string
+	obfsOption          *simpleObfsOption
+	v2rayOption         *v2rayObfs.Option
+	v2rayUDPRelayOption *v2rayObfs.UDPRelayOption
+	gostOption          *gost.Option
+	shadowTLSOption     *shadowtls.ShadowTLSOption
+	restlsConfig        *restls.Config
+	kcptunClient        *kcptun.Client
 }
 
 type ShadowSocksOption struct {
@@ -72,6 +74,8 @@ type v2rayObfsOption struct {
 	Mux                      bool              `obfs:"mux,omitempty"`
 	V2rayHttpUpgrade         bool              `obfs:"v2ray-http-upgrade,omitempty"`
 	V2rayHttpUpgradeFastOpen bool              `obfs:"v2ray-http-upgrade-fast-open,omitempty"`
+	UDPMode                  string            `obfs:"udp-mode,omitempty"`
+	UDPTimeout               int               `obfs:"udp-timeout,omitempty"`
 }
 
 type gostObfsOption struct {
@@ -248,6 +252,20 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
 	if err := ss.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
+	if ss.v2rayUDPRelayOption != nil {
+		serverAddr, err := resolveUDPAddr(ctx, "udp", ss.addr, ss.prefer)
+		if err != nil {
+			return nil, err
+		}
+		relayOption := *ss.v2rayUDPRelayOption
+		relayOption.ServerAddr = serverAddr.String()
+		relayPC, err := v2rayObfs.NewUDPRelayPacketConn(ctx, relayOption)
+		if err != nil {
+			return nil, err
+		}
+		pc := ss.method.DialPacketConn(bufio.NewBindPacketConn(relayPC, udpRelaySourceAddr(metadata)))
+		return newPacketConn(pc, ss), nil
+	}
 
 	pc, addr, err := ss.listenPacketContext(ctx)
 	if err != nil {
@@ -255,6 +273,16 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
 	}
 	pc = ss.method.DialPacketConn(bufio.NewBindPacketConn(pc, addr))
 	return newPacketConn(pc, ss), nil
+}
+
+func udpRelaySourceAddr(metadata *C.Metadata) net.Addr {
+	if metadata.RawSrcAddr != nil {
+		return metadata.RawSrcAddr
+	}
+	if metadata.SourceValid() {
+		return net.UDPAddrFromAddrPort(metadata.SourceAddrPort())
+	}
+	return metadata.UDPAddr()
 }
 
 // ProxyInfo implements C.ProxyAdapter
@@ -287,12 +315,19 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
 	}
 
 	var v2rayOption *v2rayObfs.Option
+	var v2rayUDPRelayOption *v2rayObfs.UDPRelayOption
 	var gostOption *gost.Option
 	var obfsOption *simpleObfsOption
 	var shadowTLSOpt *shadowtls.ShadowTLSOption
 	var restlsConfig *restls.Config
 	var kcptunClient *kcptun.Client
 	obfsMode := ""
+
+	if option.Plugin != "v2ray-plugin" {
+		if udpMode, ok := option.PluginOpts["udp-mode"]; ok && fmt.Sprint(udpMode) != "" {
+			return nil, fmt.Errorf("ss %s initialize v2ray-plugin error: udp-mode %s only supports plugin v2ray-plugin", addr, udpMode)
+		}
+	}
 
 	decoder := structure.NewDecoder(structure.Option{TagName: "obfs", WeaklyTypedInput: true})
 	if option.Plugin == "obfs" {
@@ -314,6 +349,12 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
 
 		if opts.Mode != "websocket" {
 			return nil, fmt.Errorf("ss %s obfs mode error: %s", addr, opts.Mode)
+		}
+		if opts.UDPMode != "" && opts.UDPMode != v2rayObfs.UDPRelayModeQUIC {
+			return nil, fmt.Errorf("ss %s initialize v2ray-plugin error: udp-mode %s", addr, opts.UDPMode)
+		}
+		if option.UDPOverTCP && opts.UDPMode == v2rayObfs.UDPRelayModeQUIC {
+			return nil, fmt.Errorf("ss %s udp-over-tcp and udp-mode %s are mutually exclusive", addr, opts.UDPMode)
 		}
 		obfsMode = opts.Mode
 		v2rayOption = &v2rayObfs.Option{
@@ -337,6 +378,23 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
 				return nil, fmt.Errorf("ss %s initialize v2ray-plugin error: %w", addr, err)
 			}
 			v2rayOption.ECHConfig = echConfig
+		}
+		if opts.UDPMode == v2rayObfs.UDPRelayModeQUIC {
+			timeout := time.Duration(opts.UDPTimeout) * time.Second
+			if timeout <= 0 {
+				timeout = v2rayObfs.DefaultUDPRelayTimeout
+			}
+			v2rayUDPRelayOption = &v2rayObfs.UDPRelayOption{
+				ServerAddr:     addr,
+				Host:           opts.Host,
+				TLS:            opts.TLS,
+				ECHConfig:      v2rayOption.ECHConfig,
+				SkipCertVerify: opts.SkipCertVerify,
+				Fingerprint:    opts.Fingerprint,
+				Certificate:    opts.Certificate,
+				PrivateKey:     opts.PrivateKey,
+				Timeout:        timeout,
+			}
 		}
 	} else if option.Plugin == "gost-plugin" {
 		opts := gostObfsOption{Host: "bing.com", Mux: true}
@@ -464,15 +522,19 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
 		}),
 		method: method,
 
-		option:          &option,
-		obfsMode:        obfsMode,
-		v2rayOption:     v2rayOption,
-		gostOption:      gostOption,
-		obfsOption:      obfsOption,
-		shadowTLSOption: shadowTLSOpt,
-		restlsConfig:    restlsConfig,
-		kcptunClient:    kcptunClient,
+		option:              &option,
+		obfsMode:            obfsMode,
+		v2rayOption:         v2rayOption,
+		v2rayUDPRelayOption: v2rayUDPRelayOption,
+		gostOption:          gostOption,
+		obfsOption:          obfsOption,
+		shadowTLSOption:     shadowTLSOpt,
+		restlsConfig:        restlsConfig,
+		kcptunClient:        kcptunClient,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
+	if outbound.v2rayUDPRelayOption != nil {
+		outbound.v2rayUDPRelayOption.Dialer = outbound.dialer
+	}
 	return outbound, nil
 }
