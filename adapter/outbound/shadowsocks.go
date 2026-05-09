@@ -285,6 +285,13 @@ func udpRelaySourceAddr(metadata *C.Metadata) net.Addr {
 	return metadata.UDPAddr()
 }
 
+func v2rayUDPRelayHost(opts v2rayObfsOption) string {
+	if host := opts.Headers["Host"]; host != "" {
+		return host
+	}
+	return opts.Host
+}
+
 // ProxyInfo implements C.ProxyAdapter
 func (ss *ShadowSocks) ProxyInfo() C.ProxyInfo {
 	info := ss.Base.ProxyInfo()
@@ -386,7 +393,7 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
 			}
 			v2rayUDPRelayOption = &v2rayObfs.UDPRelayOption{
 				ServerAddr:     addr,
-				Host:           opts.Host,
+				Host:           v2rayUDPRelayHost(opts),
 				TLS:            opts.TLS,
 				ECHConfig:      v2rayOption.ECHConfig,
 				SkipCertVerify: opts.SkipCertVerify,
