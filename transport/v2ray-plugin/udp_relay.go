@@ -20,7 +20,7 @@ import (
 const (
 	UDPRelayModeQUIC       = "quic"
 	UDPRelayALPN           = "v2ray-plugin-sip003u"
-	DefaultUDPRelayTimeout = 300 * time.Second
+	DefaultUDPRelayTimeout = 30 * time.Second
 )
 
 // UDPRelayOption carries the internal client settings for SIP003U UDP relay.
@@ -52,6 +52,7 @@ type UDPRelayPacketConn struct {
 	option     UDPRelayOption
 	tlsConfig  *tls.Config
 	quicConfig *quic.Config
+	timeout    time.Duration
 
 	access  sync.Mutex
 	flows   map[string]*udpRelayClientFlow
@@ -73,10 +74,12 @@ func NewUDPRelayPacketConn(ctx context.Context, option UDPRelayOption) (*UDPRela
 		option:     option,
 		tlsConfig:  tlsConfig,
 		quicConfig: udpRelayQUICConfig(timeout),
+		timeout:    timeout,
 		flows:      map[string]*udpRelayClientFlow{},
 		readCh:     make(chan udpRelayPacket, 1024),
 		closeCh:    make(chan struct{}),
 	}
+	go conn.cleanupLoop()
 	return conn, ctx.Err()
 }
 
@@ -97,7 +100,7 @@ func (c *UDPRelayPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	flow.lastSeen = time.Now()
+	c.touchFlow(flow)
 	if err := flow.conn.SendDatagram(p); err != nil {
 		return 0, err
 	}
@@ -141,6 +144,7 @@ func (c *UDPRelayPacketConn) flow(ctx context.Context, addr net.Addr) (*udpRelay
 	flow := c.flows[key]
 	c.access.Unlock()
 	if flow != nil {
+		c.touchFlow(flow)
 		return flow, nil
 	}
 
@@ -159,6 +163,12 @@ func (c *UDPRelayPacketConn) flow(ctx context.Context, addr net.Addr) (*udpRelay
 	c.access.Unlock()
 	go c.readLoop(key, addr, flow)
 	return flow, nil
+}
+
+func (c *UDPRelayPacketConn) touchFlow(flow *udpRelayClientFlow) {
+	c.access.Lock()
+	flow.lastSeen = time.Now()
+	c.access.Unlock()
 }
 
 func (c *UDPRelayPacketConn) newFlow(ctx context.Context, addr net.Addr) (*udpRelayClientFlow, error) {
@@ -200,12 +210,47 @@ func (c *UDPRelayPacketConn) readLoop(key string, addr net.Addr, flow *udpRelayC
 		if err != nil {
 			return
 		}
-		flow.lastSeen = time.Now()
+		c.touchFlow(flow)
 		select {
 		case c.readCh <- udpRelayPacket{data: data, addr: addr}:
 		case <-c.closeCh:
 			return
 		}
+	}
+}
+
+func (c *UDPRelayPacketConn) cleanupLoop() {
+	interval := c.timeout / 2
+	if interval <= 0 {
+		interval = DefaultUDPRelayTimeout / 2
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.cleanupIdleFlows(time.Now())
+		case <-c.closeCh:
+			return
+		}
+	}
+}
+
+func (c *UDPRelayPacketConn) cleanupIdleFlows(now time.Time) {
+	var idleFlows []*udpRelayClientFlow
+	c.access.Lock()
+	for key, flow := range c.flows {
+		if now.Sub(flow.lastSeen) >= c.timeout {
+			delete(c.flows, key)
+			idleFlows = append(idleFlows, flow)
+		}
+	}
+	c.access.Unlock()
+
+	for _, flow := range idleFlows {
+		_ = flow.conn.CloseWithError(0, "")
+		_ = flow.pc.Close()
 	}
 }
 

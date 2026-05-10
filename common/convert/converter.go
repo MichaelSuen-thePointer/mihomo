@@ -461,12 +461,23 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 						host = pluginInfo.Get("obfs-host")
 					}
 					ss["plugin"] = "v2ray-plugin"
-					ss["plugin-opts"] = map[string]any{
+					pluginOpts := map[string]any{
 						"mode": mode,
 						"host": host,
 						"path": pluginInfo.Get("path"),
 						"tls":  strings.Contains(plugin, "tls"),
 					}
+					if udpMode := firstNotEmpty(pluginInfo.Get("udp-mode"), pluginInfo.Get("udpMode")); udpMode != "" {
+						pluginOpts["udp-mode"] = udpMode
+					}
+					if udpTimeout := firstNotEmpty(pluginInfo.Get("udp-timeout"), pluginInfo.Get("udpTimeout")); udpTimeout != "" {
+						if timeout, err := strconv.Atoi(udpTimeout); err == nil {
+							pluginOpts["udp-timeout"] = timeout
+						} else {
+							pluginOpts["udp-timeout"] = udpTimeout
+						}
+					}
+					ss["plugin-opts"] = pluginOpts
 				}
 			}
 
@@ -702,6 +713,15 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 	}
 
 	return proxies, nil
+}
+
+func firstNotEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func uniqueName(names map[string]int, name string) string {

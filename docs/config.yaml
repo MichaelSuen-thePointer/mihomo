@@ -469,6 +469,8 @@ proxies: # socks5
       # skip-cert-verify: true
       # host: bing.com
       # path: "/"
+      # udp-mode: quic # enable SIP003U UDP relay over QUIC Datagram, mutually exclusive with udp-over-tcp
+      # udp-timeout: 30 # idle timeout in seconds for SIP003U UDP relay
       # mux: true
       # headers:
       #   custom: value
