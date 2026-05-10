@@ -56,6 +56,7 @@ type UDPRelayPacketConn struct {
 
 	access  sync.Mutex
 	flows   map[string]*udpRelayClientFlow
+	closed  bool
 	readCh  chan udpRelayPacket
 	closeCh chan struct{}
 	once    sync.Once
@@ -100,7 +101,6 @@ func (c *UDPRelayPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	c.touchFlow(flow)
 	if err := flow.conn.SendDatagram(p); err != nil {
 		return 0, err
 	}
@@ -113,6 +113,7 @@ func (c *UDPRelayPacketConn) Close() error {
 		close(c.closeCh)
 		c.access.Lock()
 		defer c.access.Unlock()
+		c.closed = true
 		for key, flow := range c.flows {
 			err = errors.Join(err, flow.conn.CloseWithError(0, ""))
 			err = errors.Join(err, flow.pc.Close())
@@ -141,10 +142,16 @@ func (c *UDPRelayPacketConn) SetWriteDeadline(time.Time) error {
 func (c *UDPRelayPacketConn) flow(ctx context.Context, addr net.Addr) (*udpRelayClientFlow, error) {
 	key := addr.String()
 	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		return nil, net.ErrClosed
+	}
 	flow := c.flows[key]
+	if flow != nil {
+		flow.lastSeen = time.Now()
+	}
 	c.access.Unlock()
 	if flow != nil {
-		c.touchFlow(flow)
 		return flow, nil
 	}
 
@@ -153,7 +160,14 @@ func (c *UDPRelayPacketConn) flow(ctx context.Context, addr net.Addr) (*udpRelay
 		return nil, err
 	}
 	c.access.Lock()
+	if c.closed {
+		c.access.Unlock()
+		_ = flow.conn.CloseWithError(0, "")
+		_ = flow.pc.Close()
+		return nil, net.ErrClosed
+	}
 	if oldFlow := c.flows[key]; oldFlow != nil {
+		oldFlow.lastSeen = time.Now()
 		c.access.Unlock()
 		_ = flow.conn.CloseWithError(0, "")
 		_ = flow.pc.Close()
@@ -163,12 +177,6 @@ func (c *UDPRelayPacketConn) flow(ctx context.Context, addr net.Addr) (*udpRelay
 	c.access.Unlock()
 	go c.readLoop(key, addr, flow)
 	return flow, nil
-}
-
-func (c *UDPRelayPacketConn) touchFlow(flow *udpRelayClientFlow) {
-	c.access.Lock()
-	flow.lastSeen = time.Now()
-	c.access.Unlock()
 }
 
 func (c *UDPRelayPacketConn) newFlow(ctx context.Context, addr net.Addr) (*udpRelayClientFlow, error) {
@@ -210,7 +218,9 @@ func (c *UDPRelayPacketConn) readLoop(key string, addr net.Addr, flow *udpRelayC
 		if err != nil {
 			return
 		}
-		c.touchFlow(flow)
+		c.access.Lock()
+		flow.lastSeen = time.Now()
+		c.access.Unlock()
 		select {
 		case c.readCh <- udpRelayPacket{data: data, addr: addr}:
 		case <-c.closeCh:

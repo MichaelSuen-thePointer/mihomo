@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -286,8 +287,10 @@ func udpRelaySourceAddr(metadata *C.Metadata) net.Addr {
 }
 
 func v2rayUDPRelayHost(opts v2rayObfsOption) string {
-	if host := opts.Headers["Host"]; host != "" {
-		return host
+	for key, value := range opts.Headers {
+		if strings.EqualFold(key, "Host") && value != "" {
+			return value
+		}
 	}
 	return opts.Host
 }
